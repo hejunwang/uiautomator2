@@ -26,26 +26,27 @@ import re
 import sys
 import shutil
 import xml.dom.minidom
-import xml.etree.ElementTree as ET
 import threading
 import warnings
+import logging
+import functools
 from datetime import datetime
 from subprocess import list2cmdline
+from collections import namedtuple
 
 import six
 import humanize
 import progress.bar
 from retry import retry
+import six.moves.urllib.parse as urlparse
 
 if six.PY2:
-    import urlparse
     FileNotFoundError = OSError
-else:  # for py3
-    import urllib.parse as urlparse
 
 import requests
 from uiautomator2 import adbutils
 from uiautomator2.version import __apk_version__, __atx_agent_version__
+from uiautomator2 import simplexml
 
 DEBUG = False
 HTTP_TIMEOUT = 60
@@ -76,6 +77,7 @@ class JsonRpcError(UiaError):
             -32602: 'Invalid params',
             -32603: 'Internal error',
             -32001: 'Jsonrpc error',
+            -32002: 'Client error',
         }
         if errcode in m:
             return m[errcode]
@@ -83,14 +85,16 @@ class JsonRpcError(UiaError):
             return 'Server error'
         return 'Unknown error'
 
-    def __init__(self, error={}):
+    def __init__(self, error={}, method=None):
         self.code = error.get('code')
         self.message = error.get('message', '')
         self.data = error.get('data', '')
+        self.method = method
 
     def __str__(self):
-        return '%d %s: %s' % (self.code, self.format_errcode(self.code),
-                              '<%s> data: %s' % (self.message, self.data))
+        return '%d %s: <%s> data: %s, method: %s' % (
+            self.code, self.format_errcode(self.code), self.message, self.data,
+            self.method)
 
     def __repr__(self):
         return repr(str(self))
@@ -108,7 +112,11 @@ class UiAutomationNotConnectedError(JsonRpcError):
     pass
 
 
-class NullExceptionError(JsonRpcError):
+class NullObjectExceptionError(JsonRpcError):
+    pass
+
+
+class NullPointerExceptionError(JsonRpcError):
     pass
 
 
@@ -154,10 +162,34 @@ def E(x):
     return x.encode('utf-8') if type(x) is unicode else x
 
 
+def _is_wifi_addr(addr):
+    if not addr:
+        return False
+    if re.match(r"^https?://", addr):
+        return True
+    m = re.search(r"(\d+\.\d+\.\d+\.\d+)", addr)
+    if m and m.group(1) != "127.0.0.1":
+        return True
+    return False
+
+
+def hooks_wrap(fn):
+    @functools.wraps(fn)
+    def inner(self, *args, **kwargs):
+        name = fn.__name__.lstrip('_')
+        self.server.hooks_apply("before", name, args, kwargs, None)
+        ret = fn(self, *args, **kwargs)
+        self.server.hooks_apply("after", name, args, kwargs, ret)
+    return inner
+
+
 def connect(addr=None):
     """
     Args:
         addr (str): uiautomator server address or serial number. default from env-var ANDROID_DEVICE_IP
+
+    Returns:
+        UIAutomatorServer
 
     Example:
         connect("10.0.0.1:7912")
@@ -168,7 +200,7 @@ def connect(addr=None):
     """
     if not addr or addr == '+':
         addr = os.getenv('ANDROID_DEVICE_IP')
-    if addr and re.match(r"(http://)?(\d+\.\d+\.\d+\.\d+)(:\d+)?", addr):
+    if _is_wifi_addr(addr):
         return connect_wifi(addr)
     return connect_usb(addr)
 
@@ -177,6 +209,9 @@ def connect_wifi(addr=None):
     """
     Args:
         addr (str) uiautomator server address.
+
+    Returns:
+        UIAutomatorServer
 
     Examples:
         connect_wifi("10.0.0.1")
@@ -196,13 +231,38 @@ def connect_usb(serial=None):
     """
     Args:
         serial (str): android device serial
+
+    Returns:
+        UIAutomatorServer
     """
     adb = adbutils.Adb(serial)
     lport = adb.forward_port(7912)
-    return connect_wifi('127.0.0.1:' + str(lport))
+    d = connect_wifi('127.0.0.1:' + str(lport))
+    if not d.agent_alive:
+        warnings.warn("backend atx-agent is not alive, start again ...",
+                      RuntimeWarning)
+        adb.execute(
+            "shell", "PATH=$PATH:/data/local/tmp:/data/data/com.android/shell",
+            "atx-agent", "server", "-d")
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if d.alive:
+                break
+    elif not d.alive:
+        warnings.warn("backend uiautomator2 is not alive, start again ...",
+                      RuntimeWarning)
+        d.reset_uiautomator()
+    return d
 
 
 class TimeoutRequestsSession(requests.Session):
+    def __init__(self):
+        super(TimeoutRequestsSession, self).__init__()
+        # refs: https://stackoverflow.com/questions/33895739/python-requests-cant-load-any-url-remote-end-closed-connection-without-respo
+        adapter = requests.adapters.HTTPAdapter(max_retries=3)
+        self.mount("http://", adapter)
+        self.mount("https://", adapter)
+
     def request(self, method, url, **kwargs):
         if kwargs.get('timeout') is None:
             kwargs['timeout'] = HTTP_TIMEOUT
@@ -231,8 +291,36 @@ class TimeoutRequestsSession(requests.Session):
             return resp
 
 
+def plugin_register(name, plugin, *args, **kwargs):
+    """
+    Add plugin into UIAutomatorServer
+    
+    Args:
+        name: string
+        plugin: class or function which take d as first parameter
+    
+    Example:
+        def upload_screenshot(d):
+            def inner():
+                d.screenshot("tmp.jpg")
+                # use requests.post upload tmp.jpg
+            return inner
+        
+        plugin_register("upload_screenshot", save_screenshot)
+        
+        d = u2.connect()
+        d.ext_upload_screenshot()
+    """
+    UIAutomatorServer.plugins()[name] = (plugin, args, kwargs)
+
+
+def plugin_clear():
+    UIAutomatorServer.plugins().clear()
+
+
 class UIAutomatorServer(object):
     __isfrozen = False
+    __plugins = {}
 
     def __init__(self, host, port=7912):
         """
@@ -250,17 +338,23 @@ class UIAutomatorServer(object):
         self._server_url = 'http://{}:{}'.format(host, port)
         self._server_jsonrpc_url = self._server_url + "/jsonrpc/0"
         self._default_session = Session(self, None)
+        self._cached_plugins = {}
         self.__devinfo = None
+        self._hooks = {}
         self.platform = None  # hot fix for weditor
 
+        self.ash = AdbShell(self.shell)  # the powerful adb shell
         self.wait_timeout = 20.0  # wait element timeout
         self.click_post_delay = None  # wait after each click
-
         self._freeze()  # prevent creating new attrs
         # self._atx_agent_check()
 
     def _freeze(self):
         self.__isfrozen = True
+
+    @staticmethod
+    def plugins():
+        return UIAutomatorServer.__plugins
 
     def __setattr__(self, key, value):
         """ Prevent creating new attributes outside __init__ """
@@ -304,6 +398,15 @@ class UIAutomatorServer(object):
     def serial(self):
         return self.shell(['getprop', 'ro.serialno'])[0].strip()
 
+    @property
+    def jsonrpc(self):
+        """
+        Make jsonrpc call easier
+        For example:
+            self.jsonrpc.pressKey("home")
+        """
+        return self.setup_jsonrpc()
+
     def path2url(self, path):
         return urlparse.urljoin(self._server_url, path)
 
@@ -315,14 +418,20 @@ class UIAutomatorServer(object):
             w, h = h, w
         return w, h
 
-    @property
-    def jsonrpc(self):
+    def hooks_register(self, func):
         """
-        Make jsonrpc call easier
-        For example:
-            self.jsonrpc.pressKey("home")
+        Args:
+            func: should accept 3 args. func_name:string, args:tuple, kwargs:dict
         """
-        return self.setup_jsonrpc()
+        self._hooks[func] = True
+
+    def hooks_apply(self, stage, func_name, args=(), kwargs={}, ret=None):
+        """
+        Args:
+            stage(str): one of "before" or "after"
+        """
+        for fn in self._hooks.keys():
+            fn(stage, func_name, args, kwargs, ret)
 
     def setup_jsonrpc(self, jsonrpc_url=None):
         """
@@ -354,19 +463,28 @@ class UIAutomatorServer(object):
                            **kwargs):  # method, params=[], http_timeout=60):
         try:
             return self.jsonrpc_call(*args, **kwargs)
-        except (GatewayError, UiAutomationNotConnectedError):
+        except (GatewayError, ):
             warnings.warn(
                 "uiautomator2 is not reponding, restart uiautomator2 automatically",
                 RuntimeWarning,
                 stacklevel=1)
             # for XiaoMi, want to recover uiautomator2 must start app:com.github.uiautomator
-            self.healthcheck(unlock=False)
+            self.reset_uiautomator()
             return self.jsonrpc_call(*args, **kwargs)
-        except (NullExceptionError, StaleObjectExceptionError) as e:
+        except UiAutomationNotConnectedError:
             warnings.warn(
-                "uiautomator2 raise exception %s, and run code again" % e,
+                "UiAutomation not connected, restart uiautoamtor",
                 RuntimeWarning,
                 stacklevel=1)
+            self.reset_uiautomator()
+            return self.jsonrpc_call(*args, **kwargs)
+        except (NullObjectExceptionError,
+                NullPointerExceptionError, StaleObjectExceptionError) as e:
+            if args[1] != 'dumpWindowHierarchy': # args[1] method
+                warnings.warn(
+                    "uiautomator2 raise exception %s, and run code again" % e,
+                    RuntimeWarning,
+                    stacklevel=1)
             time.sleep(1)
             return self.jsonrpc_call(*args, **kwargs)
 
@@ -384,7 +502,7 @@ class UIAutomatorServer(object):
         }
         data = json.dumps(data).encode('utf-8')
         res = self._reqsess.post(
-            jsonrpc_url,
+            jsonrpc_url, # +"?m="+method, #?method is for debug
             headers={"Content-Type": "application/json"},
             timeout=http_timeout,
             data=data)
@@ -406,12 +524,12 @@ class UIAutomatorServer(object):
             return jsondata.get('result')
 
         # error happends
-        err = JsonRpcError(error)
+        err = JsonRpcError(error, method)
 
-        if err.message:
-            if 'UiAutomation not connected' in err.message:
-                err.__class__ = UiAutomationNotConnectedError
-            elif 'uiautomator.UiObjectNotFoundException' in err.message:
+        if isinstance(err.data, six.string_types) and 'UiAutomation not connected' in err.data:
+            err.__class__ = UiAutomationNotConnectedError
+        elif err.message:
+            if 'uiautomator.UiObjectNotFoundException' in err.message:
                 err.__class__ = UiObjectNotFoundError
             elif 'android.support.test.uiautomator.StaleObjectException' in err.message:
                 # StaleObjectException
@@ -420,13 +538,23 @@ class UIAutomatorServer(object):
                 # In this case, it is necessary to call findObject(BySelector) to obtain a new UiObject2 instance.
                 err.__class__ = StaleObjectExceptionError
             elif 'java.lang.NullObjectException' in err.message:
-                err.__class__ = NullExceptionError
+                err.__class__ = NullObjectExceptionError
+            elif 'java.lang.NullPointerException' == err.message:
+                err.__class__ = NullPointerExceptionError
         raise err
 
     def _jsonrpc_id(self, method):
         m = hashlib.md5()
         m.update(("%s at %f" % (method, time.time())).encode("utf-8"))
         return m.hexdigest()
+
+    @property
+    def agent_alive(self):
+        try:
+            r = self._reqsess.get(self.path2url('/version'), timeout=2)
+            return r.status_code == 200
+        except:
+            return False
 
     @property
     def alive(self):
@@ -478,22 +606,17 @@ class UIAutomatorServer(object):
 
         return _Service(name)
 
-    def healthcheck(self, unlock=True):
+    def reset_uiautomator(self):
         """
-        Check if uiautomator is running, if not launch again
-
-        Args:
-            unlock (bool): unlock screen before
+        Reset uiautomator
 
         Raises:
             RuntimeError
         """
-        if unlock:
-            self.open_identify()
-
+        # self.open_identify()
         self._reqsess.delete(
             self.path2url('/uiautomator'))  # stop uiautomator keeper first
-        wait = not unlock  # should not wait IdentifyActivity open or it will stuck sometimes
+        # wait = not unlock  # should not wait IdentifyActivity open or it will stuck sometimes
         self.app_start(  # may also stuck here.
             'com.github.uiautomator',
             '.MainActivity',
@@ -505,9 +628,11 @@ class UIAutomatorServer(object):
         self._reqsess.post(self.path2url('/uiautomator'))
 
         # wait until uiautomator2 service working
-        deadline = time.time() + 10.0
+        deadline = time.time() + 20.0
         while time.time() < deadline:
-            print(time.ctime(), "wait uiautomator is ready.")
+            print(
+                time.strftime("[%Y-%m-%d %H:%M:%S]"),
+                "uiautomator is starting ...")
             if self.alive:
                 # keyevent BACK if current is com.github.uiautomator
                 # XiaoMi uiautomator will kill the app(com.github.uiautomator) when launch
@@ -517,18 +642,38 @@ class UIAutomatorServer(object):
                         'am', 'startservice', '-n',
                         'com.github.uiautomator/.Service'
                     ])
-                    time.sleep(.5)
-                    return True
+                    time.sleep(1.5)
                 else:
                     time.sleep(.5)
                     self.shell(['input', 'keyevent', 'BACK'])
-                    return True
+                print("uiautomator back to normal")
+                return True
             time.sleep(1)
-        raise RuntimeError("Uiautomator started failed.")
+        raise RuntimeError(
+            "Uiautomator started failed. Find solutions in https://github.com/openatx/uiautomator2/wiki/Common-issues"
+        )
 
-    def app_install(self, url, installing_callback=None):
+    def healthcheck(self):
         """
-        {u'message': u'downloading', "progress": {u'titalSize': 407992690, u'copiedSize': 49152}}
+        Reset device into ready state
+
+        Raises:
+            RuntimeError
+        """
+        sh = self.ash
+        if not sh.is_screen_on():
+            print(time.strftime("[%Y-%m-%d %H:%M:%S]"), "wakeup screen")
+            sh.keyevent("WAKEUP")
+            sh.keyevent("HOME")
+            sh.swipe(0.1, 0.9, 0.9, 0.1)  # swipe to unlock
+
+        sh.keyevent("HOME")
+        sh.keyevent("BACK")
+        self.reset_uiautomator()
+
+    def app_install(self, url, installing_callback=None, server=None):
+        """
+        {u'message': u'downloading', "progress": {u'totalSize': 407992690, u'copiedSize': 49152}}
 
         Returns:
             packageName
@@ -606,13 +751,6 @@ class UIAutomatorServer(object):
                 self._reqsess.delete(self.path2url('/install/' + id))
                 raise
 
-    def dump_hierarchy(self, compressed=False, pretty=False):
-        content = self.jsonrpc.dumpWindowHierarchy(compressed, None)
-        if pretty and "\n " not in content:
-            xml_text = xml.dom.minidom.parseString(content.encode("utf-8"))
-            content = U(xml_text.toprettyxml(indent='  '))
-        return content
-
     def shell(self, cmdargs, stream=False, timeout=60):
         """
         Run adb shell command with arguments and return its output. Require atx-agent >=0.3.3
@@ -651,7 +789,8 @@ class UIAutomatorServer(object):
         resp = ret.json()
         exit_code = 1 if resp.get('error') else 0
         exit_code = resp.get('exitCode', exit_code)
-        return resp.get('output'), exit_code
+        shell_response = namedtuple("ShellResponse", ("output", "exit_code"))
+        return shell_response(resp.get('output'), exit_code)
 
     def adb_shell(self, *args):
         """
@@ -680,7 +819,7 @@ class UIAutomatorServer(object):
         Args:
             pkg_name (str): package name
             activity (str): app activity
-            stop (str): Stop app before starting the activity. (require activity)
+            stop (bool): Stop app before starting the activity. (require activity)
         """
         if unlock:
             self.unlock()
@@ -694,7 +833,7 @@ class UIAutomatorServer(object):
             # -e <EXTRA_KEY> <EXTRA_STRING_VALUE>
             # --ei <EXTRA_KEY> <EXTRA_INT_VALUE>
             # --ez <EXTRA_KEY> <EXTRA_BOOLEAN_VALUE>
-            args = ['am', 'start']
+            args = ['am', 'start', '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER']
             if wait:
                 args.append('-W')
             if stop:
@@ -720,18 +859,28 @@ class UIAutomatorServer(object):
                 'android.intent.category.LAUNCHER', '1'
             ])
 
+    @retry(EnvironmentError, delay=.5, tries=3, jitter=.1)
     def current_app(self):
         """
         Returns:
             dict(package, activity, pid?)
 
+        Raises:
+            EnvironementError
+
         For developer:
-            Function healthcheck need this function, so can't use jsonrpc here.
+            Function reset_uiautomator need this function, so can't use jsonrpc here.
         """
-        # try: adb shell dumpsys window windows
+        # Related issue: https://github.com/openatx/uiautomator2/issues/200
+        # $ adb shell dumpsys window windows
+        # Example output:
+        #   mCurrentFocus=Window{41b37570 u0 com.incall.apps.launcher/com.incall.apps.launcher.Launcher}
+        #   mFocusedApp=AppWindowToken{422df168 token=Token{422def98 ActivityRecord{422dee38 u0 com.example/.UI.play.PlayActivity t14}}}
+        # Regexp
+        #   r'mFocusedApp=.*ActivityRecord{\w+ \w+ (?P<package>.*)/(?P<activity>.*) .*'
+        #   r'mCurrentFocus=Window{\w+ \w+ (?P<package>.*)/(?P<activity>.*)\}')
         _focusedRE = re.compile(
-            r'mFocusedApp=.*ActivityRecord{\w+ \w+ (?P<package>.*)/(?P<activity>.*) .*'
-        )
+            r'mCurrentFocus=Window{.*\s+(?P<package>[^\s]+)/(?P<activity>[^\s]+)\}')
         m = _focusedRE.search(self.shell(['dumpsys', 'window', 'windows'])[0])
         if m:
             return dict(
@@ -739,7 +888,7 @@ class UIAutomatorServer(object):
 
         # try: adb shell dumpsys activity top
         _activityRE = re.compile(
-            r'ACTIVITY (?P<package>[^/]+)/(?P<activity>[^/\s]+) \w+ pid=(?P<pid>\d+)'
+            r'ACTIVITY (?P<package>[^\s]+)/(?P<activity>[^/\s]+) \w+ pid=(?P<pid>\d+)'
         )
         output, _ = self.shell(['dumpsys', 'activity', 'top'])
         ms = _activityRE.finditer(output)
@@ -749,11 +898,9 @@ class UIAutomatorServer(object):
                 package=m.group('package'),
                 activity=m.group('activity'),
                 pid=int(m.group('pid')))
-        if ret:
+        if ret: # get last result
             return ret
-        # empty result
-        warnings.warn("Couldn't get focused app", stacklevel=2)
-        return dict(package=None, activity=None)
+        raise EnvironmentError("Couldn't get focused app")
 
     def app_stop(self, pkg_name):
         """ Stop one application: am force-stop"""
@@ -918,16 +1065,6 @@ class UIAutomatorServer(object):
         self.__devinfo = self._reqsess.get(self.path2url('/info')).json()
         return self.__devinfo
 
-    # def set_accessibility_patterns(self, patterns):
-    #     """
-    #     Args:
-    #         patterns (dict): key is package name, value is button text
-
-    #     Example value of patterns:
-    #         {"com.android.packageinstaller": [u"确定", u"安装"]}
-    #     """
-    #     self.jsonrpc.setAccessibilityPatterns(patterns)
-
     def disable_popups(self, enable=True):
         """
         Automatic click all popups
@@ -960,31 +1097,40 @@ class UIAutomatorServer(object):
         Raises:
             requests.HTTPError, SessionBrokenError
         """
+        if pkg_name is None:
+            return self._default_session
+
         if not attach:
             resp = self._reqsess.post(
                 self.path2url("/session/" + pkg_name), data={"flags": "-W -S"})
+            if resp.status_code == 410:  # Gone
+                raise SessionBrokenError(pkg_name, resp.text)
             resp.raise_for_status()
             jsondata = resp.json()
             if not jsondata["success"]:
                 raise SessionBrokenError("app launch failed",
                                          jsondata["error"], jsondata["output"])
 
-            time.sleep(0.5)  # wait launch finished, maybe no need
+            time.sleep(2.5)  # wait launch finished, maybe no need
         pid = self._pidof_app(pkg_name)
         if not pid:
             raise SessionBrokenError(pkg_name)
         return Session(self, pkg_name, pid)
 
-    def dismiss_apps(self):
-        """
-        UiDevice.getInstance().pressRecentApps();
-        UiObject recentapp = new UiObject(new UiSelector().resourceId("com.android.systemui:id/dismiss_task"));
-        """
-        raise NotImplementedError()
-        self.press("recent")
-
     def __getattr__(self, attr):
-        return getattr(self._default_session, attr)
+        if attr in self._cached_plugins:
+            return self._cached_plugins[attr]
+        if attr.startswith('ext_'):
+            if attr[4:] not in self.__plugins:
+                raise ValueError("plugin \"%s\" not registed" % attr[4:])
+            func, args, kwargs = self.__plugins[attr[4:]]
+            obj = functools.partial(func, self)(*args, **kwargs)
+            self._cached_plugins[attr] = obj
+            return obj
+        try:
+            return getattr(self._default_session, attr)
+        except AttributeError:
+            raise AttributeError("'Session or UIAutomatorServer' object has no attribute '%s'" % attr)
 
     def __call__(self, **kwargs):
         return self._default_session(**kwargs)
@@ -1015,11 +1161,34 @@ class Session(object):
                                           (pid, pkg_name))
             self._jsonrpc = server.setup_jsonrpc(jsonrpc_url)
 
+        # hot fix for session missing shell function
+        self.shell = self.server.shell
+
     def __repr__(self):
         if self._pid and self._pkg_name:
             return "<uiautomator2.Session pid:%d pkgname:%s>" % (
                 self._pid, self._pkg_name)
         return super(Session, self).__repr__()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def implicitly_wait(self, seconds=None):
+        """set default wait timeout
+        Args:
+            seconds(float): to wait element show up
+        """
+        if seconds is not None:
+            self.server.wait_timeout = seconds
+        return self.server.wait_timeout
+
+    def close(self):
+        """ close app """
+        if self._pkg_name:
+            self.server.app_stop(self._pkg_name)
 
     def running(self):
         """
@@ -1062,7 +1231,46 @@ class Session(object):
             text (str): text to show
             duration (float): seconds of display
         """
+        warnings.warn(
+            "Use d.toast.show(text, duration) instead.",
+            DeprecationWarning,
+            stacklevel=2)
         return self.jsonrpc.makeToast(text, duration * 1000)
+
+    @property
+    def toast(self):
+        obj = self
+
+        class Toast(object):
+            def get_message(self,
+                            wait_timeout=10,
+                            cache_timeout=10,
+                            default=None):
+                """
+                Args:
+                    wait_timeout: seconds of max wait time if toast now show right now
+                    cache_timeout: return immediately if toast showed in recent $cache_timeout
+                    default: default messsage to return when no toast show up
+
+                Returns:
+                    None or toast message
+                """
+                deadline = time.time() + wait_timeout
+                while 1:
+                    message = obj.jsonrpc.getLastToast(cache_timeout * 1000)
+                    if message:
+                        return message
+                    if time.time() > deadline:
+                        return default
+                    time.sleep(.5)
+
+            def reset(self):
+                return obj.jsonrpc.clearLastToast()
+
+            def show(self, text, duration=1.0):
+                return obj.jsonrpc.makeToast(text, duration * 1000)
+
+        return Toast()
 
     @check_alive
     def set_fastinput_ime(self, enable=True):
@@ -1097,6 +1305,33 @@ class Session(object):
             # self.server.adb_shell("input", "text", text.replace(" ", "%s"))
 
     @check_alive
+    def send_action(self, code):
+        """
+        Simulate input method edito code
+        
+        Args:
+            code (str or int): input method editor code
+        
+        Examples:
+            send_action("search"), send_action(3)
+        
+        Refs:
+            https://developer.android.com/reference/android/view/inputmethod/EditorInfo
+        """
+        self.wait_fastinput_ime()
+        __alias = {
+            "go": 2,
+            "search": 3,
+            "send": 4,
+            "next": 5,
+            "done": 6,
+            "previous": 7,
+        }
+        if isinstance(code, six.string_types):
+            code = __alias.get(code, code)
+        self.server.shell(['am', 'broadcast', '-a', 'ADB_EDITOR_CODE', '--ei', 'code', str(code)])
+
+    @check_alive
     def clear_text(self):
         """ clear text
         Raises:
@@ -1117,7 +1352,7 @@ class Session(object):
             EnvironmentError
         """
         if not self.server.serial:  # maybe simulator eg: genymotion, 海马玩模拟器
-            raise EnvironmentError("Android simulator detected.")
+            raise EnvironmentError("Android simulator is not supported.")
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -1182,7 +1417,11 @@ class Session(object):
         click position
         """
         x, y = self.pos_rel2abs(x, y)
-        ret = self.jsonrpc.click(x, y)
+        self._click(x, y)
+    
+    @hooks_wrap
+    def _click(self, x, y):
+        self.jsonrpc.click(x, y)
         if self.server.click_post_delay:  # click code delay
             time.sleep(self.server.click_post_delay)
 
@@ -1204,17 +1443,22 @@ class Session(object):
         if not duration:
             duration = 0.5
         x, y = self.pos_rel2abs(x, y)
+        return self._long_click(x, y, duration)
+    
+    @hooks_wrap
+    def _long_click(self, x, y, duration):
         self.touch.down(x, y)
         time.sleep(duration)
         self.touch.up(x, y)
         return self
 
-    def swipe(self, fx, fy, tx, ty, duration=0.5):
+    def swipe(self, fx, fy, tx, ty, duration=0.1, steps=None):
         """
         Args:
             fx, fy: from position
             tx, ty: to position
             duration (float): duration
+            steps: 1 steps is about 5ms, if set, duration will be ignore
 
         Documents:
             uiautomator use steps instead of duration
@@ -1226,7 +1470,13 @@ class Session(object):
         rel2abs = self.pos_rel2abs
         fx, fy = rel2abs(fx, fy)
         tx, ty = rel2abs(tx, ty)
-        return self.jsonrpc.swipe(fx, fy, tx, ty, int(duration * 200))
+        if not steps:
+            steps = int(duration * 200)
+        self._swipe(fx, fy, tx, ty, steps)
+    
+    @hooks_wrap
+    def _swipe(self, fx, fy, tx, ty, steps):
+        return self.jsonrpc.swipe(fx, fy, tx, ty, steps)
 
     def swipe_points(self, points, duration=0.5):
         """
@@ -1285,6 +1535,18 @@ class Session(object):
             import numpy as np
             nparr = np.fromstring(r.content, np.uint8)
             return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        elif format == 'raw':
+            return r.content
+        else:
+            raise RuntimeError("Invalid format " + format)
+
+    @retry(NullPointerExceptionError, delay=.5, tries=5, jitter=0.2)
+    def dump_hierarchy(self, compressed=False, pretty=False):
+        content = self.jsonrpc.dumpWindowHierarchy(compressed, None)
+        if pretty and "\n " not in content:
+            xml_text = xml.dom.minidom.parseString(content.encode("utf-8"))
+            content = U(xml_text.toprettyxml(indent='  '))
+        return content
 
     def freeze_rotation(self, freeze=True):
         '''freeze or unfreeze the device rotation in current status.'''
@@ -1330,9 +1592,6 @@ class Session(object):
         else:
             raise ValueError("Invalid orientation.")
 
-    # @orientation.setter
-    # def orientation(self, value):
-
     @property
     def last_traversed_text(self):
         '''get last traversed text. used in webview for highlighted text.'''
@@ -1351,10 +1610,16 @@ class Session(object):
     def exists(self, **kwargs):
         return self(**kwargs).exists
 
-    def xpath_findall(self, xpath):
-        xml = self.server.dump_hierarchy()
-        root = ET.fromstring(xml)
-        return root.findall(xpath)
+    def xpath(self, xpath, source=None):
+        """
+        Args:
+            xpath: expression of XPath2.0
+            source: optional, hierarchy from dump_hierarchy()
+
+        Returns:
+            XPathSelector
+        """
+        return XPathSelector(xpath, self.server, source)
 
     def watcher(self, name):
         obj = self
@@ -1375,8 +1640,9 @@ class Session(object):
                 return self
 
             def click(self, **kwargs):
+                target = Selector(**kwargs) if kwargs else self.__selectors[-1]
                 obj.server.jsonrpc.registerClickUiObjectWatcher(
-                    name, self.__selectors, Selector(**kwargs))
+                    name, self.__selectors, target)
 
             def press(self, *keys):
                 """
@@ -1420,7 +1686,7 @@ class Session(object):
 
             @property
             def watched(self):
-                raise NotImplementedError()
+                return obj.server.jsonrpc.hasWatchedOnWindowsChange()
 
             @watched.setter
             def watched(self, b):
@@ -1429,7 +1695,7 @@ class Session(object):
                     b: boolean
                 """
                 assert isinstance(b, bool)
-                obj.server.jsonrpc.runWatchersOnWindowsChanged(b)
+                obj.server.jsonrpc.runWatchersOnWindowsChange(b)
 
         return Watchers()
 
@@ -1441,6 +1707,7 @@ class Session(object):
         return UiObject(self, Selector(**kwargs))
 
 
+# Will be removed in the future
 def wrap_wait_exists(fn):
     @functools.wraps(fn)
     def inner(self, *args, **kwargs):
@@ -1468,17 +1735,22 @@ class UiObject(object):
     @property
     def exists(self):
         '''check if the object exists in current window.'''
-        return self.jsonrpc.exist(self.selector)
+        return Exists(self)
 
     @property
+    @retry(
+        UiObjectNotFoundError, delay=.5, tries=3, jitter=0.1, logger=logging)
     def info(self):
         '''ui object info.'''
         return self.jsonrpc.objInfo(self.selector)
 
-    @wrap_wait_exists
-    def click(self):
+    def click(self, timeout=None, offset=None):
         """
         Click UI element. 
+
+        Args:
+            timeout: seconds wait element show up
+            offset: (xoff, yoff) default (0.5, 0.5) -> center
 
         The click method does the same logic as java uiautomator does.
         1. waitForExists 2. get VisibleBounds center 3. send click event
@@ -1486,7 +1758,8 @@ class UiObject(object):
         Raises:
             UiObjectNotFoundError
         """
-        x, y = self.center()
+        self.must_wait(timeout=timeout)
+        x, y = self.center(offset=offset)
         # ext.htmlreport need to comment bellow code
         # if info['clickable']:
         #     return self.jsonrpc.click(self.selector)
@@ -1495,15 +1768,23 @@ class UiObject(object):
         if delay:
             time.sleep(delay)
 
-    def center(self):
+    def center(self, offset=None):
         """
+        Args:
+            offset: optional, (x_off, y_off)
+                (0, 0) means center, (0.5, 0.5) means right-bottom
         Return:
             center point (x, y)
         """
         info = self.info
         bounds = info.get('visibleBounds') or info.get("bounds")
-        x = (bounds['left'] + bounds['right']) / 2
-        y = (bounds['top'] + bounds['bottom']) / 2
+        lx, ly, rx, ry = bounds['left'], bounds['top'], bounds['right'], bounds['bottom']
+        if not offset:
+            offset = (0.5, 0.5)
+        xoff, yoff = offset
+        width, height = rx - lx, ry - ly
+        x = lx + width * xoff
+        y = ly + height * yoff
         return (x, y)
 
     def click_gone(self, maxretry=10, interval=1.0):
@@ -1533,21 +1814,24 @@ class UiObject(object):
         except UiObjectNotFoundError:
             return False
 
-    @wrap_wait_exists
-    def long_click(self, duration=None):
+    def long_click(self, duration=None, timeout=None):
         """
         Args:
             duration (float): seconds of pressed
+            timeout (float): seconds wait element show up
         """
 
         # if info['longClickable'] and not duration:
         #     return self.jsonrpc.longClick(self.selector)
+        self.must_wait(timeout=timeout)
         x, y = self.center()
         return self.session.long_click(x, y, duration)
 
-    @wrap_wait_exists
     def drag_to(self, *args, **kwargs):
         duration = kwargs.pop('duration', 0.5)
+        timeout = kwargs.pop('timeout', None)
+        self.must_wait(timeout=timeout)
+
         steps = int(duration * 200)
         if len(args) >= 2 or "x" in kwargs or "y" in kwargs:
 
@@ -1558,6 +1842,38 @@ class UiObject(object):
 
             return drag2xy(*args, **kwargs)
         return self.jsonrpc.dragTo(self.selector, Selector(**kwargs), steps)
+
+    def swipe(self, direction, steps=10):
+        """
+        Performs the swipe action on the UiObject.
+        Swipe from center
+
+        Args:
+            direction (str): one of ("left", "right", "up", "down")
+            steps (int): move steps, one step is about 5ms
+            percent: float between [0, 1]
+
+        Note: percent require API >= 18
+        # assert 0 <= percent <= 1
+        """
+        assert direction in ("left", "right", "up", "down")
+
+        self.must_wait()
+        info = self.info
+        bounds = info.get('visibleBounds') or info.get("bounds")
+        lx, ly, rx, ry = bounds['left'], bounds['top'], bounds['right'], bounds['bottom']
+        cx, cy = (lx+rx)//2, (ly+ry)//2
+        if direction == 'up':
+            self.session.swipe(cx, cy, cx, ly, steps=steps)
+        elif direction == 'down':
+            self.session.swipe(cx, cy, cx,  ry - 1, steps=steps)
+        elif direction == 'left':
+            self.session.swipe(cx, cy, lx, cy, steps=steps)
+        elif direction == 'right':
+            self.session.swipe(cx, cy, rx - 1, cy, steps=steps)
+
+        # return self.jsonrpc.swipe(self.selector, direction, percent, steps)
+
 
     def gesture(self, start1, start2, end1, end2, steps=100):
         '''
@@ -1583,7 +1899,7 @@ class UiObject(object):
     def pinch_out(self, percent=100, steps=50):
         return self.jsonrpc.pinchOut(self.selector, percent, steps)
 
-    def wait(self, exists=True, timeout=10):
+    def wait(self, exists=True, timeout=None):
         """
         Wait until UI Element exists or gone
 
@@ -1594,13 +1910,23 @@ class UiObject(object):
             d(text="Clock").wait()
             d(text="Settings").wait("gone") # wait until it's gone
         """
+        if timeout is None:
+            timeout = self.wait_timeout
         http_wait = timeout + 10
         if exists:
-            return self.jsonrpc.waitForExists(
-                self.selector, int(timeout * 1000), http_timeout=http_wait)
+            try:
+                return self.jsonrpc.waitForExists(
+                    self.selector, int(timeout * 1000), http_timeout=http_wait)
+            except requests.ReadTimeout as e:
+                warnings.warn("waitForExists readTimeout: %s" % e, RuntimeWarning)
+                return self.exists()
         else:
-            return self.jsonrpc.waitUntilGone(
-                self.selector, int(timeout * 1000), http_timeout=http_wait)
+            try:
+                return self.jsonrpc.waitUntilGone(
+                    self.selector, int(timeout * 1000), http_timeout=http_wait)
+            except requests.ReadTimeout as e:
+                warnings.warn("waitForExists readTimeout: %s" % e, RuntimeWarning)
+                return not self.exists()
 
     def wait_gone(self, timeout=None):
         """ wait until ui gone
@@ -1610,24 +1936,29 @@ class UiObject(object):
         timeout = timeout or self.wait_timeout
         return self.wait(exists=False, timeout=timeout)
 
+    def must_wait(self, exists=True, timeout=None):
+        """ wait and if not found raise UiObjectNotFoundError """
+        if not self.wait(exists, timeout):
+            raise UiObjectNotFoundError({'code': -32002, 'method': 'wait'})
+
     def send_keys(self, text):
         """ alias of set_text """
         return self.set_text(text)
 
-    @wrap_wait_exists
-    def set_text(self, text):
+    def set_text(self, text, timeout=None):
+        self.must_wait(timeout=timeout)
         if not text:
             return self.jsonrpc.clearTextField(self.selector)
         else:
             return self.jsonrpc.setText(self.selector, text)
 
-    @wrap_wait_exists
-    def get_text(self):
+    def get_text(self, timeout=None):
         """ get text from field """
+        self.must_wait(timeout=timeout)
         return self.jsonrpc.getText(self.selector)
 
-    @wrap_wait_exists
-    def clear_text(self):
+    def clear_text(self, timeout=None):
+        self.must_wait(timeout=timeout)
         return self.set_text(None)
 
     def child(self, **kwargs):
@@ -1675,7 +2006,7 @@ class UiObject(object):
 
     def __getitem__(self, index):
         selector = self.selector.clone()
-        selector['instance'] = index
+        selector.update_instance(index)
         return UiObject(self.session, selector)
 
     @property
@@ -1914,3 +2245,143 @@ class Selector(dict):
         self[self.__childOrSibling].append("sibling")
         self[self.__childOrSiblingSelector].append(Selector(**kwargs))
         return self
+
+    def update_instance(self, i):
+        # update inside child instance
+        if self[self.__childOrSiblingSelector]:
+            self[self.__childOrSiblingSelector][-1]['instance'] = i
+        else:
+            self['instance'] = i
+
+
+class Exists(object):
+    """Exists object with magic methods."""
+
+    def __init__(self, uiobject):
+        self.uiobject = uiobject
+
+    def __nonzero__(self):
+        """Magic method for bool(self) python2 """
+        return self.uiobject.jsonrpc.exist(self.uiobject.selector)
+
+    def __bool__(self):
+        """ Magic method for bool(self) python3 """
+        return self.__nonzero__()
+
+    def __call__(self, timeout=0):
+        """Magic method for self(args).
+
+        Args:
+            timeout (float): exists in seconds
+        """
+        if timeout:
+            return self.uiobject.wait(timeout=timeout)
+        return bool(self)
+
+    def __repr__(self):
+        return str(bool(self))
+
+
+class XPathSelector(object):
+    def __init__(self, xpath, server, source=None):
+        self.xpath = xpath
+        self.server = server
+        self.source = source
+
+    def wait(self, timeout=10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            elements = self.all()
+            if elements:
+                return elements[0]
+            time.sleep(.5)
+
+    def click(self, timeout=10.0):
+        """
+        click element
+        """
+        elem = self.wait(timeout=timeout)
+        if not elem:
+            raise UiaError(self.xpath)
+        x, y = elem.center()
+        self.server.click(x, y)
+
+    def all(self):
+        """
+        Returns:
+            list of XMLElement
+        """
+        xml_content = self.source or self.server.dump_hierarchy()
+        return [
+            XMLElement(node)
+            for node in simplexml.xpath_findall(self.xpath, xml_content)
+        ]
+
+    @property
+    def exists(self):
+        return len(self.all()) > 0
+
+
+class XMLElement(object):
+    def __init__(self, elem):
+        self.elem = elem
+
+    def center(self):
+        bounds = self.elem.attrib.get("bounds")
+        lx, ly, rx, ry = map(int, re.findall("\d+", bounds))
+        return (lx + rx) // 2, (ly + ry) // 2
+
+    @property
+    def text(self):
+        return self.elem.attrib.get("text")
+
+    @property
+    def attrib(self):
+        return self.elem.attrib
+
+
+class AdbShell(object):
+    def __init__(self, shellfn):
+        """
+        Args:
+            shellfn: Shell function
+        """
+        self.shell = shellfn
+
+    def wmsize(self):
+        """ get window size
+        Returns:
+            (width, height)
+        """
+        output, _ = self.shell("wm size")
+        m = re.match(r"Physical size: (\d+)x(\d+)", output)
+        if m:
+            return map(int, m.groups())
+        raise RuntimeError("Can't parse wm size: " + output)
+
+    def is_screen_on(self):
+        output, _ = self.shell("dumpsys power")
+        return 'mHoldingDisplaySuspendBlocker=true' in output
+
+    def keyevent(self, v):
+        """
+        Args:
+            v: eg home wakeup back
+        """
+        v = v.upper()
+        self.shell("input keyevent " + v)
+
+    def _adjust_pos(self, x, y, w=None, h=None):
+        if x < 1:
+            x = x * w
+        if y < 1:
+            y = y * h
+        return (x, y)
+
+    def swipe(self, x0, y0, x1, y1):
+        w, h = None, None
+        if x0 < 1 or y0 < 1 or x1 < 1 or y1 < 1:
+            w, h = self.wmsize()
+        x0, y0 = self._adjust_pos(x0, y0, w, h)
+        x1, y1 = self._adjust_pos(x1, y1, w, h)
+        self.shell("input swipe %d %d %d %d" % (x0, y0, x1, y1))

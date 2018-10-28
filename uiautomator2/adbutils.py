@@ -26,8 +26,22 @@ class Adb(object):
     def adb_path(self):
         return whichcraft.which("adb")
 
+    def devices(self, states=['device', 'offline']):
+        """
+        Returns:
+            [($serial1, "device"), ($serial2, "offline")]
+        """
+        output = subprocess.check_output([self.adb_path(), 'devices'])
+        pattern = re.compile(
+            r'(?P<serial>[^\s]+)\t(?P<status>device|offline)')
+        matches = pattern.findall(output.decode())
+        return [(m[0], m[1]) for m in matches]
+
     def execute(self, *args, **kwargs):
         """
+        Example:
+            output = execute("ls", "-l")
+
         Raises:
             EnvironmentError
         """
@@ -53,7 +67,8 @@ class Adb(object):
     def serial(self):
         if self._serial:
             return self._serial
-        self._serial = self.getprop('ro.serialno')
+        self._serial = subprocess.check_output(
+            [self.adb_path(), "get-serialno"]).decode('utf-8').strip()
         return self._serial
 
     def forward(self, local, remote, rebind=True):

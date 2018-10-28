@@ -24,10 +24,12 @@ def mark_point(im, x, y):
     """
     draw = ImageDraw.Draw(im)
     w, h = im.size
-    draw.line((x, 0, x, h), fill=128, width=1)
-    draw.line((0, y, w, y), fill=128, width=1)
-    r = min(im.size) // 50
+    draw.line((x, 0, x, h), fill='red', width=5)
+    draw.line((0, y, w, y), fill='red', width=5)
+    r = min(im.size) // 40
     draw.ellipse((x - r, y - r, x + r, y + r), fill='red')
+    r = min(im.size) // 50
+    draw.ellipse((x - r, y - r, x + r, y + r), fill='white')
     del draw
     return im
 
@@ -165,3 +167,4 @@ class HTMLReport(object):
         Remove record for click operation
         """
         self._unpatch_func(uiautomator2.Session, 'click')
+        self._unpatch_func(uiautomator2.Session, 'long_click')

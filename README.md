@@ -13,14 +13,27 @@ uiautomator2 是一个可以使用Python对Android设备进行UI自动化的库�
 
 虽然我说的很简单，但是实现起来用到了很多的技术和技巧，功能非常强，唯独文档有点少。哈哈
 
-![QQ Icon](docs/img/qq-international-icon-32.png) QQ沟通群: *499563266*
+QQ群号: *499563266*
+
+![QQ QRCode](docs/img/qqgroup.png)
+
+# Table of contents
+- **[Installation](#installation)**
+- **[Usage](#usage)**
+  - **[Command line](#command-line)**
+  - **[Quick start](#quick-start)**
+- **[API Documents](#api-documents)**
+
+# Limitation 限制
+- Android OS Version >= 4.4
+- Python >=2.7 <= 3.6
 
 # Installation
 1. Install uiautomator2
 
     ```bash
     # Since uiautomator2 is still under development, you have to add --pre to install the development version
-    pip install --pre uiautomator2
+    pip install --upgrade --pre uiautomator2
 
     # Or you can install directly from github source
     git clone https://github.com/openatx/uiautomator2
@@ -37,17 +50,70 @@ uiautomator2 是一个可以使用Python对Android设备进行UI自动化的库�
     电脑连接上一个手机或多个手机, 确保adb已经添加到环境变量中，执行下面的命令会自动安装本库所需要的设备端程序：[uiautomator-server](https://github.com/openatx/android-uiautomator-server/releases) 、[atx-agent](https://github.com/openatx/atx-agent)、[openstf/minicap](https://github.com/openstf/minicap)、[openstf/minitouch](https://github.com/openstf/minitouch)
 
     ```bash
+    # init 所有的已经连接到电脑的设备
     python -m uiautomator2 init
+    ```
+
+    因为中国的网络限制，访问Github的资源速度会比较慢，执行上面的命令可能很费时间，所以我们专门制作了一个国内的[Github镜像网站](https://github-mirror.open.netease.com)，网站采用的是请求时缓存的策略，所以全网第一次请求需要等待一会。
+    使用国内镜像只要增加一个参数`--mirror`
+
+    ```bash
+    python -m uiautomator2 init --mirror
+    ```
+    
+    也可以使用`--serial`可以指定单个设备
+    ```
+    python -m uiautomator2 init --mirror --serial $SERIAL
     ```
 
     安装提示`success`即可
 
-# Usage 使用指南
-部署 `atx-agent`之后，设备可以和电脑通过WiFi链接，设备上的`atx-agent`安装完成后会自动提示手机的IP是多少。下文中我们用`device_ip`这个变量来表示手机的IP，这个IP唯一标示一个设备。
+3. Install weditor(UI Inspector)
 
-如果手机的WiFi跟电脑不是一个网段的，不能使用WiFi互联功能，需要通过数据线将手机连接到电脑上，使用命令`adb forward tcp:7912 tcp:7912` 将手机上的服务端口7912转发到电脑上，然后使用`device_ip=127.0.0.1`连接该手机。
+    因为uiautomator是独占资源，所以当atx运行的时候uiautomatorviewer是不能用的，为了减少atx频繁的启停，我们开发了基于浏览器技术的weditor UI查看器。<https://github.com/openatx/weditor>
 
-## 命令行使用
+    安装方法
+
+    ```bash
+    pip install --pre -U weditor
+    ```
+
+    > Windows系统可以使用命令在桌面创建一个快捷方式 `python -m weditor --shortcut`
+
+    命令行启动 `python -m weditor` 会自动打开浏览器，输入设备的ip或者序列号，点击Connect即可。
+
+    具体参考文章：[浅谈自动化测试工具python-uiautomator2](https://testerhome.com/topics/11357)
+
+    
+## QUICK START
+There are two ways to connect to the device. Run the following Python code in a Python 2.7/3+ interpreter:
+
+1. Through WiFi (recommended)
+Suppose device IP is `10.0.0.1` and your PC is in the same network.
+
+```python
+import uiautomator2 as u2
+
+d = u2.connect('10.0.0.1') # alias for u2.connect_wifi('10.0.0.1')
+print(d.info)
+```
+
+2. Through USB
+Suppose the device serial is `123456f` (seen from `adb devices`)
+
+```python
+import uiautomator2 as u2
+
+d = u2.connect('123456f') # alias for u2.connect_usb('123456f')
+print(d.info)
+```
+
+Calling `u2.connect()` with no argument, `uiautomator2` will obtain device IP from the environment variable `ANDROID_DEVICE_IP`.
+If this environment variable is empty, uiautomator will fall back to `connect_usb` and you need to make sure that there is only one device connected to the computer.
+
+## Command line
+其中的`$device_ip`代表设备的ip地址
+
 - init: 为设备安装所需要的程序
 - install: 安装apk，apk通过URL给出
 
@@ -81,32 +147,6 @@ uiautomator2 是一个可以使用Python对Android设备进行UI自动化的库�
     ```bash
     $ python -m uiautomator2 healthcheck $device_ip
     ```
-    
-## QUICK START
-There are two ways to connect to the device. Run the following Python code in a Python 2.7/3+ interpreter:
-
-1. Through WiFi (recommended)
-Suppose device IP is `10.0.0.1` and your PC is in the same network.
-
-```python
-import uiautomator2 as u2
-
-d = u2.connect('10.0.0.1') # alias for u2.connect_wifi('10.0.0.1')
-print(d.info)
-```
-
-2. Through USB
-Suppose the device serial is `123456f` (seen from `adb devices`)
-
-```python
-import uiautomator2 as u2
-
-d = u2.connect('123456f') # alias for u2.connect_usb('123456f')
-print(d.info)
-```
-
-Calling `u2.connect()` with no argument, `uiautomator2` will obtain device IP from the environment variable `ANDROID_DEVICE_IP`.
-If this environment variable is empty, uiautomator will fall back to `connect_usb` and you need to make sure that there is only one device connected to the computer.
 
 ## 一些常用但是不知道归到什么类里的函数
 先中文写着了，国外大佬们先用Google Translate顶着
@@ -123,21 +163,11 @@ If this environment variable is empty, uiautomator will fall back to `connect_us
 d.healthcheck()
 ```
 
-### 连接本地USB设备
-需要设备曾经使用`python -m uiautomator2 init`初始化过
+### 点击坐标出现偏移
+为了提高uiautomator2再有播放器界面不卡死，代码中将默认3000ms中的waitForIdleTimeout改成了0，不过有可能会造成坐标偏移，虽然概率不大。
+如果出现这种情况，可以将其调大一点 `d.jsonrpc.setConfigurator({"waitForIdleTimeout": 100})`
 
-```python
-d = u2.connect_usb("{Your-Device-Serial}")
-```
-
-### 一定时间内，出现则点击
-10s内如果出现Skip则点击
-
-```python
-clicked = d(text='Skip').click_exists(timeout=10.0)
-```
-
-### 如何停用UiAutomator的守护程序
+### 如何停用UiAutomator的守护程序 How to stop UiAutomator process keeper
 因为有`atx-agent`的存在，Uiautomator会被一直守护着，如果退出了就会被重新启动起来。但是Uiautomator又是霸道的，一旦它在运行，手机上的辅助功能、电脑上的uiautomatorviewer 就都不能用了，除非关掉该框架本身的uiautomator。下面就说下两种关闭方法
 
 方法1：
@@ -148,24 +178,17 @@ clicked = d(text='Skip').click_exists(timeout=10.0)
 
 ```python
 d.service("uiautomator").stop()
+# d.service("uiautomator").start()
 ```
 
-### 打开调试开关
-用于开发者或有经验的使用者定位问题
-
-```python
->>> d.debug = True
->>> d.info
-12:32:47.182 $ curl -X POST -d '{"jsonrpc": "2.0", "id": "b80d3a488580be1f3e9cb3e926175310", "method": "deviceInfo", "params": {}}' 'http://127.0.0.1:54179/jsonrpc/0'
-12:32:47.225 Response >>>
-{"jsonrpc":"2.0","id":"b80d3a488580be1f3e9cb3e926175310","result":{"currentPackageName":"com.android.mms","displayHeight":1920,"displayRotation":0,"displaySizeDpX":360,"displaySizeDpY":640,"displayWidth":1080,"productName"
-:"odin","screenOn":true,"sdkInt":25,"naturalOrientation":true}}
-<<< END
-```
 
 **Notes:** In below examples, we use `d` to represent the uiautomator2 object for the connected device.
 
-# Table of Contents
+# API Documents
+**[Global settings](#global-settings)**
+  - **[Debug HTTP requests](#debug-http-requests)**
+  - **[Implicit wait](#implicit-wait)**
+
 **[App management](#app-management)**
   - **[Install an app](#install-an-app)**
   - **[Launch an app](#launch-an-app)**
@@ -186,6 +209,7 @@ d.service("uiautomator").stop()
   - **[Global settings](#global-settings)**
   - **[Input method](#input-method)**
   - **[Toast](#toast)**
+  - **[XPath](#xpath)**
 
 **[测试方法](#测试方法)**
 
@@ -196,6 +220,34 @@ d.service("uiautomator").stop()
 **[Contributors](#contributors)**
 
 **[LICENSE](#license)**
+
+## Global settings
+This part contains some global settings
+
+### Debug HTTP requests
+Trace HTTP requests and response to find out how it works.
+
+```python
+>>> d.debug = True
+>>> d.info
+12:32:47.182 $ curl -X POST -d '{"jsonrpc": "2.0", "id": "b80d3a488580be1f3e9cb3e926175310", "method": "deviceInfo", "params": {}}' 'http://127.0.0.1:54179/jsonrpc/0'
+12:32:47.225 Response >>>
+{"jsonrpc":"2.0","id":"b80d3a488580be1f3e9cb3e926175310","result":{"currentPackageName":"com.android.mms","displayHeight":1920,"displayRotation":0,"displaySizeDpX":360,"displaySizeDpY":640,"displayWidth":1080,"productName"
+:"odin","screenOn":true,"sdkInt":25,"naturalOrientation":true}}
+<<< END
+```
+
+### Implicit wait
+Set default element wait time, unit seconds
+
+```python
+d.implicitly_wait(10.0)
+d(text="Settings").click() # if Settings button not show in 10s, UiObjectNotFoundError will raised
+
+print("wait timeout", d.implicitly_wait()) # get default implicit wait
+```
+
+This function will have influence on `click`, `long_click`, `drag_to`, `get_text`, `set_text`, `clear_text`, etc.
 
 ## App management
 This part showcases how to perform app management
@@ -289,6 +341,11 @@ This part showcases how to perform common device operations:
     output, exit_code = d.shell("pwd", timeout=60) # timeout 60s (Default)
     # output: "/\n", exit_code: 0
     # Similar to command: adb shell pwd
+
+    # Since `shell` function return type is `namedtuple("ShellResponse", ("output", "exit_code"))`
+    # so we can do some tricks
+    output = d.shell("pwd").output
+    exit_code = d.shell("pwd").output
     ```
 
     The first argument can be list. for example
@@ -323,10 +380,18 @@ This part showcases how to perform common device operations:
 ### Session
 Session represent an app lifestyle. Can be used to start app, detect app crash.
 
-* Launch app
+* Launch and close app
 
     ```python
     sess = d.session("com.netease.cloudmusic") # start 网易云音乐
+    sess.close() # 停止网易云音乐
+    ```
+
+* Use python `with` to launch and close app
+
+    ```python
+    with d.session("com.netease.cloudmusic") as sess:
+        sess(text="Play").click()
     ```
 
 * Attach to the running app
@@ -351,6 +416,7 @@ Session represent an app lifestyle. Can be used to start app, detect app crash.
     # Warning: function name may change in the future
     sess.running() # True or False
     ```
+
 
 ### Retrieve the device info
 
@@ -542,13 +608,17 @@ Note: click, swipe, drag operations support percentage position values. Example:
     d.screenshot("home.jpg")
     
     # get PIL.Image formatted images. Naturally, you need pillow installed first
-    image = d.screenshot()
+    image = d.screenshot() # default format="pillow"
     image.save("home.jpg") # or home.png. Currently, only png and jpg are supported
 
     # get opencv formatted images. Naturally, you need numpy and cv2 installed first
     import cv2
     image = d.screenshot(format='opencv')
     cv2.imwrite('home.jpg', image)
+
+    # get raw jpeg data
+    imagebin = d.screenshot(format='raw')
+    open("some.jpg", "wb").write(imagebin)
     ```
 
 * Dump UI hierarchy
@@ -708,6 +778,9 @@ Selector supports below parameters. Refer to [UiSelector Java doc](http://develo
     ```python
     d(text="Settings").exists # True if exists, else False
     d.exists(text="Settings") # alias of above property.
+
+    # advanced usage
+    d(text="Settings").exists(timeout=3) # wait Settings appear in 3s, same as .wait(3)
     ```
 
 * Retrieve the info of the specific UI object
@@ -756,6 +829,7 @@ Selector supports below parameters. Refer to [UiSelector Java doc](http://develo
 
     ```python
     x, y = d(text="Settings").center()
+    # x, y = d(text="Settings").center(offset=(0, 0)) # left-top x, y
     ```
     
 #### Perform the click action on the selected UI object
@@ -764,10 +838,20 @@ Selector supports below parameters. Refer to [UiSelector Java doc](http://develo
     ```python
     # click on the center of the specific ui object
     d(text="Settings").click()
+    
     # wait element to appear for at most 10 seconds and then click
     d(text="Settings").click(timeout=10)
+    
+    # click with offset(x_offset, y_offset)
+    # click_x = x_offset * width + x_left_top
+    # click_y = y_offset * height + y_left_top
+    d(text="Settings").click(offset=(0.5, 0.5)) # Default center
+    d(text="Settings").click(offset=(0, 0)) # click left-top
+    d(text="Settings").click(offset=(1, 1)) # click right-bottom
+
     # click when exists in 10s, default timeout 0s
     clicked = d(text='Skip').click_exists(timeout=10.0)
+    
     # click until element gone, return bool
     is_gone = d(text="Skip").click_gone(maxretry=10, interval=1.0) # maxretry default 10, interval default 1.0
     ```
@@ -788,6 +872,22 @@ Selector supports below parameters. Refer to [UiSelector Java doc](http://develo
     d(text="Settings").drag_to(x, y, duration=0.5)
     # drag the UI object to (the center position of) another UI object, in 0.25 second
     d(text="Settings").drag_to(text="Clock", duration=0.25)
+    ```
+
+* Swipe from the center of the UI object to its edge
+
+    Swipe supports 4 directions:
+
+    - left
+    - right
+    - top
+    - bottom
+
+    ```python
+    d(text="Settings").swipe("right")
+    d(text="Settings").swipe("left", steps=10)
+    d(text="Settings").swipe("up", steps=20) # 1 steps is about 5ms, so 20 steps is about 0.1s
+    d(text="Settings").swipe("down", steps=20)
     ```
 
 * Two-point gesture from one point to another
@@ -880,6 +980,14 @@ You can register [watchers](http://developer.android.com/tools/help/uiautomator/
   #  .click(target)  ## perform click action on the target UiSelector.
   ```
 
+  There is also a trick about click. You can use click without arguments.
+
+  ```python
+  d.watcher("ALERT").when(text="OK").click()
+  # Same as
+  d.watcher("ALERT").when(text="OK").click(text="OK")
+  ```
+
   - Press key when a condition becomes true
 
   ```python
@@ -943,6 +1051,21 @@ You can register [watchers](http://developer.android.com/tools/help/uiautomator/
   d.watchers.run()
   ```
 
+* Run all watchers when page update.
+
+  通常可以用来自动点击权限确认框，或者自动安装
+
+  ```python
+  d.watcher("OK").when(text="OK").click(text="OK")
+  # enable auto trigger watchers
+  d.watchers.watched = True
+
+  # disable auto trigger watchers
+  d.watchers.watched = False
+
+  # get current trigger watchers status
+  assert d.watchers.watched == False
+  ```
 
 另外文档还是有很多没有写，推荐直接去看源码[__init__.py](uiautomator2/__init__.py)
 
@@ -958,19 +1081,19 @@ d.wait_timeout = 30.0 # default 20.0
 UiAutomator中的超时设置(隐藏方法)
 
 ```python
->> d.jsonrpc.getConfigurator()
-{'actionAcknowledgmentTimeout': 3000,
+>> d.jsonrpc.getConfigurator() 
+{'actionAcknowledgmentTimeout': 500,
  'keyInjectionDelay': 0,
  'scrollAcknowledgmentTimeout': 200,
- 'waitForIdleTimeout': 10000,
- 'waitForSelectorTimeout': 10000}
+ 'waitForIdleTimeout': 0,
+ 'waitForSelectorTimeout': 0}
 
 >> d.jsonrpc.setConfigurator({"waitForIdleTimeout": 100})
-{'actionAcknowledgmentTimeout': 3000,
+{'actionAcknowledgmentTimeout': 500,
  'keyInjectionDelay': 0,
  'scrollAcknowledgmentTimeout': 200,
  'waitForIdleTimeout': 100,
- 'waitForSelectorTimeout': 10000}
+ 'waitForSelectorTimeout': 0}
 ```
 
 为了防止客户端程序响应超时，`waitForIdleTimeout`和`waitForSelectorTimeout`目前已改为`0`
@@ -985,14 +1108,109 @@ d.set_fastinput_ime(True) # 切换成FastInputIME输入法
 d.send_keys("你好123abcEFG") # adb广播输入
 d.clear_text() # 清除输入框所有内容(Require android-uiautomator.apk version >= 1.0.7)
 d.set_fastinput_ime(False) # 切换成正常的输入法
+d.send_action("search") # 模拟输入法的搜索
 ```
 
+**send_action** 说明
+
+该函数可以使用的参数有 `go search send next done previous`
+
+_什么时候该使用这个函数呢？_
+
+有些时候在EditText中输入完内容之后，调用`press("search")` or `press("enter")`发现并没有什么反应。
+这个时候就需要`send_action`函数了，这里用到了只有输入法才能用的[IME_ACTION_CODE](https://developer.android.com/reference/android/view/inputmethod/EditorInfo)。
+`send_action`先broadcast命令发送给输入法操作`IME_ACTION_CODE`，由输入法完成后续跟EditText的通信。（原理我不太清楚，有了解的，提issue告诉我)
+
 ### Toast
-显示Toast
+Show Toast
 
 ```python
-d.make_toast("Hello world")
-d.make_toast("Hello world", 1.5) # show for 1.5s
+d.toast.show("Hello world")
+d.toast.show("Hello world", 1.0) # show for 1.0s, default 1.0s
+```
+
+Get Toast
+
+```python
+# [Args]
+# 5.0: max wait timeout. Default 10.0
+# 10.0: cache time. return cache toast if already toast already show up in recent 10 seconds. Default 10.0 (Maybe change in the furture)
+# "default message": return if no toast finally get. Default None
+d.toast.get_message(5.0, 10.0, "default message")
+
+# common usage
+assert "Short message" in d.toast.get_message(5.0, default="")
+
+# clear cached toast
+d.toast.reset()
+# Now d.toast.get_message(0) is None
+```
+
+### XPath
+
+For example: 其中一个节点的内容
+
+```xml
+<android.widget.TextView
+  index="2"
+  text="05:19"
+  resource-id="com.netease.cloudmusic:id/qf"
+  package="com.netease.cloudmusic"
+  content-desc=""
+  checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false"
+  scrollable="false" long-clickable="false" password="false" selected="false" visible-to-user="true"
+  bounds="[957,1602][1020,1636]" />
+```
+
+xpath定位和使用方法
+
+有些属性的名字有修改需要注意
+
+```
+description -> content-desc
+resourceId -> resource-id
+```
+
+常见用法
+
+```python
+# wait exists 10s
+d.xpath("//android.widget.TextView").wait(10.0)
+# find and click
+d.xpath("//*[@content-desc='分享']").click()
+# check exists
+if d.xpath("//android.widget.TextView[contains(@text, 'Se')]").exists:
+    print("exists")
+# get all text-view text, attrib and center point
+for elem in d.xpath("//android.widget.TextView").all():
+    print("Text:", elem.text)
+    # Dictionary eg: 
+    # {'index': '1', 'text': '999+', 'resource-id': 'com.netease.cloudmusic:id/qb', 'package': 'com.netease.cloudmusic', 'content-desc': '', 'checkable': 'false', 'checked': 'false', 'clickable': 'false', 'enabled': 'true', 'focusable': 'false', 'focused': 'false','scrollable': 'false', 'long-clickable': 'false', 'password': 'false', 'selected': 'false', 'visible-to-user': 'true', 'bounds': '[661,1444][718,1478]'}
+    print("Attrib:", elem.attrib)
+    # Coordinate eg: (100, 200)
+    print("Position:", elem.center())
+```
+
+其他XPath常见用法
+
+```
+# 所有元素
+//*
+
+# resource-id包含login字符
+//*[contains(@resource-id, 'login')]
+
+# 按钮包含账号或帐号
+//android.widget.Button[contains(@text, '账号') or contains(@text, '帐号')]
+
+# 所有ImageView中的第二个
+(//android.widget.ImageView)[2]
+
+# 所有ImageView中的最后一个
+(//android.widget.ImageView)[last()]
+
+# className包含ImageView
+//*[contains(name(), "ImageView")]
 ```
 
 ## 测试方法
@@ -1012,6 +1230,60 @@ $ curl -d '{"jsonrpc":"2.0","method":"deviceInfo","id":1}' 127.0.0.1:9008/jsonrp
 4. uiautomator2必须明确EditText框才能向里面输入文字，uiautomator直接指定父类也可以在子类中输入文字
 5. uiautomator2获取控件速度比uiautomator快
 
+## Plugin (Beta)
+为了方便uiautomator2跟其他项目集成，所以开发了这套插件机制。参考了一些[过去flask的插件机制](https://www.zoulei.net/2016/09/05/flask_plugin_note/)。
+使用示例
+
+```python
+import uiautomator2 as u2
+
+def image_save(d, fileext='.jpg'):
+    """ save screenshot plugin """
+    def inner(filename):
+        d.screenshot().save(filename+fileext)
+    return inner
+
+u2.plugin_register('png_save', image_save, '.png')
+
+d = u2.connect()
+d.ext_png_save("screen") # screenshot will save screen.png
+```
+
+这里引入了一个函数`plugin_register`
+
+```python
+def plugin_register(name, func_or_class, *args, **kwargs)
+```
+
+name代表插件的名字，`func_or_class`可以是函数，也可以是类，其第一个参数一定是`d`（设备的实例）, `args`和`kwargs`是可选参数
+
+通过`d.ext_`加上注册插件是的名字，如果插件名是`png_save`则通过`d.ext_png_save`调用。
+
+`image_save`这个函数只有在最初调用`d.ext_png_save`的时候会调用，之后都只使用第一次生成的实例。
+
+> PS: 插件的调用没有自动补全，有点不太方便
+
+## Hooks(beta)
+```python
+d = u2.connect()
+
+def callback(stage, func_name, args, kwargs, ret):
+    print("stage", stage)
+    print("call", func_name, args, kwargs)
+    print("return", ret)
+
+d.hooks_register(callback)
+d.click(0.5, 0.5)
+# expect output
+# stage: before
+# call: click (540, 960) {}
+# return: None
+# stage: after
+# call: click (540, 960) {}
+# return: None
+```
+
+Use hooks, you can capture screenshot before or after `click`, `long_click`, `double_click`, `swipe`
 ## 常见问题
 1. 提示`502`错误
 
@@ -1024,6 +1296,24 @@ $ curl -d '{"jsonrpc":"2.0","method":"deviceInfo","id":1}' 127.0.0.1:9008/jsonrp
     如果运行正常，启动测试之前增加一行代码`d.healthcheck()`
 
     如果报错，可能是缺少某个设备组件没有安装，使用下面的命令重新初始化 `python -m uiautomator2 init --reinstall`
+
+2. 提示Connection Error
+
+    可能是atx-agent没有在运行。
+
+    ```bash
+    # 检查是否运行的方法
+    > adb shell
+    $ ps | grep atx # 如果看到atx-agent则表示正在运行
+
+    # 启动atx-agent
+    $ /data/local/tmp/atx-agent -d
+
+    # 停止atx-agent
+    $ /data/local/tmp/atx-agent -stop
+    ```
+
+Other: <https://github.com/openatx/uiautomator2/wiki/Common-issues>
 
 ## 实验室功能
 ### 远程查看
